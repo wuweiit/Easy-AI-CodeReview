@@ -6,7 +6,7 @@ import atexit
 import json
 import os
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 import pandas as pd
 
@@ -19,12 +19,14 @@ from src.gitlab.webhook_handler import slugify_url
 from src.queue.worker import handle_merge_request_event, handle_push_event, handle_github_pull_request_event, \
     handle_github_push_event, handle_gitea_push_event, handle_gitea_pull_request_event
 from src.service.review_service import ReviewService
+from src.utils.code_reviewer import CodeReviewer
 from src.utils.messaging import notifier
 from src.utils.log import logger
 from src.utils.queue import handle_queue
 from src.utils.reporter import Reporter
 
 from src.utils.config_checker import check_config
+from src.llm.factory import Factory
 
 api_app = Flask(__name__, static_folder='web', static_url_path='')
 
@@ -229,19 +231,115 @@ def daily_report():
         return jsonify({'message': f"Failed to generate daily report: {e}"}), 500
 
 
+# 昨日code review
+@api_app.route('/review/yesterday_report', methods=['GET'])
+def yesterday_mr_top10():
+    """
+    获取昨天 GitLab Merge Request 的 AI 分析记录明细，整合并投递给 AI 分析 Top10
+    按分数排序（分数越低表示问题越多），返回 Top10 需要重点关注的 MR
+    """
+    try:
+        # 获取昨天的 MR 记录
+        df = ReviewService.get_yesterday_mr_review_logs()
+
+        if df.empty:
+            logger.info("No MR review logs for yesterday.")
+            return jsonify({
+                'message': 'No MR review logs for yesterday.',
+                'date': (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'),
+                'total_count': 0,
+                'top10': []
+            }), 200
+
+        # 获取 Top10（分数最低的）
+        top10_df = ReviewService.get_top10_mr_by_score(df)
+
+        # 格式化时间戳
+        if 'updated_at' in top10_df.columns:
+            top10_df['updated_at'] = top10_df['updated_at'].apply(
+                lambda ts: datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+                if isinstance(ts, (int, float)) else ts
+            )
+
+        # 格式化代码变更
+        if 'additions' in top10_df.columns and 'deletions' in top10_df.columns:
+            top10_df['delta'] = top10_df.apply(
+                lambda row: f"+{int(row['additions'])}  -{int(row['deletions'])}"
+                if not pd.isna(row['additions']) and not pd.isna(row['deletions'])
+                else "",
+                axis=1
+            )
+
+        # 转换为适合 AI 分析的格式
+        top10_records = top10_df.to_dict(orient='records')
+
+        # 构建投递给 AI 的数据
+        yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        ai_analysis_prompt = f"""
+时间: ({yesterday_str}) GitLab Merge Request 代码审查记录中，分数最低的 Top10 MR 明细如下
+"""
+        for i, record in enumerate(top10_records, 1):
+            ai_analysis_prompt += f"""
+### Top {i}
+- **项目**: {record.get('project_name', 'N/A')}
+- **作者**: {record.get('author', 'N/A')}
+- **目标分支**: {record.get('target_branch', 'N/A')}
+- **分数**: {record.get('score', 0)} 分
+- **代码变更**: +{int(record.get('additions', 0))} -{int(record.get('deletions', 0))}
+- **AI审查结果**: {record.get('review_result', 'N/A')[:500]}...
+
+"""
+
+        ai_analysis_prompt += """
+请分析以上 Top10 代码审查记录，总结以下内容：
+1. 主要存在的问题和代码质量趋势
+2. 需要重点关注的项目或开发者
+3. 改进建议
+请以 Markdown 格式返回分析报告。
+"""
+
+        # 调用 AI 进行分析
+        client = Factory().getClient()
+        ai_result = client.completions(
+            messages=[
+                {"role": "user", "content": ai_analysis_prompt}
+            ],
+        )
+
+        # 发送通知
+        notifier.send_notification(
+            content=f"{yesterday_str} GitLab MR 代码审查 Top10 分析报告:\n\n{ai_result}",
+            msg_type="markdown",
+            title=f"{yesterday_str} MR 代码审查 Top10 分析"
+        )
+
+        return jsonify({
+            'date': yesterday_str,
+            'total_count': len(df),
+            'top10_count': len(top10_records),
+            'top10': top10_records,
+            'ai_analysis': ai_result
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to generate yesterday MR top10 analysis: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
 def setup_scheduler():
     """
     配置并启动定时任务调度器
     """
     try:
         scheduler = BackgroundScheduler()
-        crontab_expression = os.getenv('REPORT_CRONTAB_EXPRESSION', '0 18 * * 1-5')
+        crontab_expression = os.getenv('REPORT_CRONTAB_EXPRESSION', '0 17 * * 1-5')
         cron_parts = crontab_expression.split()
         cron_minute, cron_hour, cron_day, cron_month, cron_day_of_week = cron_parts
 
         # Schedule the task based on the crontab expression
         scheduler.add_job(
-            daily_report,
+            yesterday_mr_top10,
             trigger=CronTrigger(
                 minute=cron_minute,
                 hour=cron_hour,

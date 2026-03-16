@@ -31,9 +31,10 @@ def on_merge_request_reviewed(mr_review_entity: MergeRequestReviewEntity):
 
 {mr_review_entity.review_result}
     """
-    notifier.send_notification(content=im_msg, msg_type='markdown', title='Merge Request Review',
-                               project_name=mr_review_entity.project_name, url_slug=mr_review_entity.url_slug,
-                               webhook_data=mr_review_entity.webhook_data)
+    # 钉钉做每日总结，这里单条通知就不需要发送了
+    # notifier.send_notification(content=im_msg, msg_type='markdown', title='Merge Request Review',
+    #                            project_name=mr_review_entity.project_name, url_slug=mr_review_entity.url_slug,
+    #                            webhook_data=mr_review_entity.webhook_data)
 
     # 记录到数据库
     ReviewService.insert_mr_review_log(mr_review_entity)

@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import pandas as pd
 
 from src.entity.review_entity import MergeRequestReviewEntity, PushReviewEntity
@@ -203,21 +204,21 @@ class ReviewService:
                 params = []
 
                 if authors:
-                    placeholders = ','.join(['?'] * len(authors))
+                    placeholders = ','.join(['%s'] * len(authors))
                     query += f" AND author IN ({placeholders})"
                     params.extend(authors)
 
                 if project_names:
-                    placeholders = ','.join(['?'] * len(project_names))
+                    placeholders = ','.join(['%s'] * len(project_names))
                     query += f" AND project_name IN ({placeholders})"
                     params.extend(project_names)
 
                 if updated_at_gte is not None:
-                    query += " AND updated_at >= ?"
+                    query += " AND updated_at >= %s"
                     params.append(updated_at_gte)
 
                 if updated_at_lte is not None:
-                    query += " AND updated_at <= ?"
+                    query += " AND updated_at <= %s"
                     params.append(updated_at_lte)
 
                 query += " ORDER BY updated_at DESC"
@@ -229,6 +230,43 @@ class ReviewService:
         except Exception as e:
             print(f"Error retrieving push review logs: {e}")
             return pd.DataFrame()
+
+    @staticmethod
+    def get_yesterday_mr_review_logs() -> pd.DataFrame:
+        """获取昨天(前一日)的 Merge Request 审核日志"""
+        try:
+            # 计算昨天的时间范围
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = datetime.now().replace(hour=23, minute=59, second=59, microsecond=0)
+            # yesterday_start = (today - timedelta(days=1)).timestamp()
+            yesterday_start = (today).timestamp() ## 今日
+            yesterday_end = (today_end).timestamp()
+
+            with get_db_connection() as conn:
+                query = """
+                    SELECT project_name, author, source_branch, target_branch, updated_at, commit_messages, score, url, review_result, additions, deletions
+                    FROM mr_review_log
+                    WHERE updated_at >= %s AND updated_at <= %s
+                    ORDER BY updated_at DESC
+                    limit 100
+                """
+                params = [yesterday_start, yesterday_end]
+
+                pandas_conn = conn.get_connection_for_pandas()
+                df = pd.read_sql_query(sql=query, con=pandas_conn, params=params)
+                print(f"[ReviewService] Retrieved {len(df)} MR review logs for yesterday")
+                return df
+        except Exception as e:
+            print(f"Error retrieving yesterday MR review logs: {e}")
+            return pd.DataFrame()
+
+    @staticmethod
+    def get_top10_mr_by_score(df: pd.DataFrame) -> pd.DataFrame:
+        """获取分数最低的 Top10 MR 记录（分数越低表示问题越多）"""
+        if df.empty:
+            return df
+        # 按分数升序排序，获取前10条（分数最低的）
+        return df.nsmallest(10, 'score')
 
 
 # Initialize database
