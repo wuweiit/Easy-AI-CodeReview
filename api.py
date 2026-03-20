@@ -27,6 +27,7 @@ from src.utils.reporter import Reporter
 
 from src.utils.config_checker import check_config
 from src.llm.factory import Factory
+import requests
 
 api_app = Flask(__name__, static_folder='web', static_url_path='')
 
@@ -231,7 +232,272 @@ def daily_report():
         return jsonify({'message': f"Failed to generate daily report: {e}"}), 500
 
 
-# 昨日code review
+@api_app.route('/api/sonarqube/quality-summary', methods=['GET'])
+def get_sonarqube_quality_summary():
+    """
+    获取 SonarQube 质量汇总报告（基于 facets 数据）
+    
+    查询参数:
+    - query: 搜索查询语句 (可选，默认："*-service")
+    - page_size: 每页数量 (可选，默认：50)
+    - send_notification: 是否发送钉钉通知 (可选，默认：false)
+    
+    返回:
+    - total: 项目总数
+    - facets: 各个维度的统计信息
+    - projects: 项目列表
+    """
+    try:
+        # 获取配置
+        sonar_url = os.getenv('SONAR_URL', 'http://dev.jinliwangluo.com:9001')
+        sonar_token = os.getenv('SONAR_TOKEN')
+        
+        if not sonar_token:
+            return jsonify({
+                'error': 'SonarQube token is required. Please set SONAR_TOKEN environment variable.'
+            }), 400
+        
+        # 获取查询参数
+        query = '*-service'
+        page_size = 50
+        send_notification = 'true'
+        
+        # 构建 API URL
+        api_url = f"{sonar_url}/api/components/search_projects"
+        params = {
+            'ps': page_size,
+            'facets': 'new_reliability_rating,new_security_rating,new_security_review_rating,new_maintainability_rating,new_coverage,new_duplicated_lines_density,new_lines,alert_status,languages,tags,qualifier',
+            'f': 'analysisDate,leakPeriodDate',
+            'filter': f'query = "{query}"',
+            'asc': 'false'
+        }
+        
+        headers = {
+            'Authorization': f'Bearer {sonar_token}'
+        }
+        
+        logger.info(f"Fetching SonarQube quality summary with query: {query}")
+        
+        response = requests.get(api_url, params=params, headers=headers, timeout=30)
+        
+        if response.status_code == 401:
+            return jsonify({
+                'error': 'Authentication failed. Please check your SONAR_TOKEN.'
+            }), 401
+        elif response.status_code != 200:
+            return jsonify({
+                'error': f'SonarQube API error: {response.status_code}',
+                'details': response.text
+            }), response.status_code
+        
+        data = response.json()
+        
+        # 提取 facets 数据
+        components = data.get('components', [])
+        facets = data.get('facets', [])
+        
+        # 整理 facets 统计信息
+        facets_summary = {}
+        for facet in facets:
+            facet_key = facet.get('property')
+            values = facet.get('values', [])
+            facets_summary[facet_key] = [
+                {
+                    'value': v.get('val'),
+                    'count': v.get('count')
+                }
+                for v in values
+            ]
+        
+        # 整理项目列表
+        projects = []
+        for comp in components:
+            project = {
+                'key': comp.get('key'),
+                'name': comp.get('name'),
+                'analysisDate': comp.get('analysisDate'),
+                'leakPeriodDate': comp.get('leakPeriodDate'),
+                'metrics': {}
+            }
+            # 提取指标
+            if 'qualifier' in comp:
+                project['qualifier'] = comp.get('qualifier')
+            projects.append(project)
+        
+        # 构建返回数据
+        result = {
+            'total': data.get('paging', {}).get('total', len(components)),
+            'facets': facets_summary,
+            'projects': projects[:10],  # 只返回前 10 个项目详情
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # 如果需要发送钉钉通知
+        if send_notification:
+            try:
+                notification_content = generate_sonarqube_notification(facets_summary, len(components), query)
+                # 打印通知内容到日志
+                logger.info(f"Generated notification content:\n{notification_content}")
+                # 发送钉钉通知
+                notifier.send_notification(
+                    content=notification_content,
+                    msg_type="markdown",
+                    title="SonarQube 质量汇总报告"
+                )
+                logger.info("SonarQube notification sent successfully")
+            except Exception as e:
+                logger.error(f"Failed to send notification: {e}")
+        
+        return jsonify(result), 200
+        
+    except requests.exceptions.Timeout:
+        logger.error("SonarQube API request timeout")
+        return jsonify({
+            'error': 'SonarQube API request timeout. Please try again later.'
+        }), 504
+    except requests.exceptions.RequestException as e:
+        logger.error(f"SonarQube API request failed: {str(e)}")
+        return jsonify({
+            'error': f'Failed to connect to SonarQube: {str(e)}'
+        }), 503
+    except Exception as e:
+        logger.error(f"Failed to get SonarQube quality summary: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
+def generate_sonarqube_notification(facets_summary, total_projects, query):
+    """
+    生成钉钉通知内容
+    
+    :param facets_summary: facets 统计数据
+    :param total_projects: 总项目数
+    :param query: 搜索查询
+    :return: Markdown 格式的通知内容
+    """
+    # 获取 SonarQube URL
+    sonar_url = os.getenv('SONAR_URL', 'http://dev.jinliwangluo.com:9001')
+    
+    # 提取各项统计数据
+    alert_status = facets_summary.get('alert_status', [])
+    reliability_rating = facets_summary.get('new_reliability_rating', [])
+    security_rating = facets_summary.get('new_security_rating', [])
+    coverage = facets_summary.get('new_coverage', [])
+    duplications = facets_summary.get('new_duplicated_lines_density', [])
+    maintainability = facets_summary.get('new_maintainability_rating', [])
+    
+    # 统计通过质量门的项目数
+    quality_gate_ok = sum(v['count'] for v in alert_status if v['value'] == 'OK')
+    # quality_gate_warn = sum(v['count'] for v in alert_status if v['value'] == 'WARN')
+    quality_gate_error = sum(v['count'] for v in alert_status if v['value'] == 'ERROR')
+    
+    # 统计可靠性评级分布
+    reliability_a = sum(v['count'] for v in reliability_rating if v['value'] == '1')
+    reliability_b = sum(v['count'] for v in reliability_rating if v['value'] == '2')
+    reliability_cde = sum(v['count'] for v in reliability_rating if v['value'] in ['3', '4', '5'])
+    
+    # 统计安全性评级分布
+    security_a = sum(v['count'] for v in security_rating if v['value'] == '1')
+    security_b = sum(v['count'] for v in security_rating if v['value'] == '2')
+    security_cde = sum(v['count'] for v in security_rating if v['value'] in ['3', '4', '5'])
+    
+    # 计算平均覆盖率（取中间值）
+    avg_coverage = 0
+    if coverage:
+        coverage_values = []
+        for v in coverage:
+            val = v.get('value')
+            if val is not None:
+                try:
+                    coverage_values.append(float(val))
+                except (ValueError, TypeError):
+                    continue
+        if coverage_values:
+            avg_coverage = sum(coverage_values) / len(coverage_values)
+    
+    # 计算平均重复率
+    avg_duplications = 0
+    if duplications:
+        duplication_values = []
+        for v in duplications:
+            val = v.get('value')
+            if val is not None:
+                try:
+                    duplication_values.append(float(val))
+                except (ValueError, TypeError):
+                    continue
+        if duplication_values:
+            avg_duplications = sum(duplication_values) / len(duplication_values)
+    
+    # 生成 Markdown 内容
+    content = f"""# 📊 SonarQube 质量汇总报告
+
+**查询条件**: `{query}`  
+**总项目数**: {total_projects}  
+**质量要求**: 宽松模式（管控严重问题）\n
+**统计时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## 🎯 █ 质量门禁状态
+
+| 状态 | 项目数 | 占比 |
+|------|--------|------|
+| <font color='green'>**☑ 通过**</font> | {quality_gate_ok} | {quality_gate_ok/total_projects*100:.1f}% |
+| <font color='red'>**✘ 失败**</font> | **{quality_gate_error}** | {quality_gate_error/total_projects*100:.1f}% |
+
+## 🔒 █ 安全性评级 
+
+| 等级 | 项目数 | 占比 |
+|------|--------|------|
+| A | {security_a} | {security_a/total_projects*100:.1f}% |
+| B | {security_b} | {security_b/total_projects*100:.1f}% |
+| <font color='red'>**C-E**</font> | **{security_cde}** | {security_cde/total_projects*100:.1f}% |
+
+### 📈 █ 可靠性评级
+
+| 等级 | 项目数 | 说明 |
+|------|--------|------|
+| A | {reliability_a} | 优秀 |
+| B | {reliability_b} | 良好 |
+| <font color='red'>**C-E**</font> | **{reliability_cde}** | 需改进 |
+
+## ▓ 关键指标
+
+- **平均单元测试覆盖率**: {avg_coverage:.1f}%
+- **平均代码重复率**: {avg_duplications:.1f}%
+
+## ⚠ █ 优化建议
+
+"""
+    
+    # 添加建议
+    suggestions = []
+    if quality_gate_error > 0:
+        suggestions.append(f"- <font color='red'>**✘**</font> {quality_gate_error} 个项目质量门失败，需要优先处理")
+    
+    if reliability_cde > 0:
+        suggestions.append(f"- 🐛 {reliability_cde} 个项目可靠性评级较差 (C-E)")
+    
+    if security_cde > 0:
+        suggestions.append(f"- 🔒 {security_cde} 个项目安全性评级较差 (C-E)")
+    
+    if avg_coverage < 80:
+        suggestions.append(f"- 📊 平均测试覆盖率低于 80% ({avg_coverage:.1f}%)")
+    
+    if avg_duplications > 5:
+        suggestions.append(f"- 📄 平均代码重复率高于 5% ({avg_duplications:.1f}%)")
+    
+    if not suggestions:
+        suggestions.append("- ✅ 整体质量状况良好，继续保持！")
+    
+    content += "\n".join(suggestions)
+    
+    content += f"\n\n查看详情：[{sonar_url}]({sonar_url}/projects)"
+    
+    return content
+
+
+
+# 昨日 code review
 @api_app.route('/review/yesterday_report', methods=['GET'])
 def yesterday_mr_top10():
     """
@@ -327,17 +593,19 @@ def yesterday_mr_top10():
         return jsonify({'error': str(e)}), 500
 
 
+
 def setup_scheduler():
     """
     配置并启动定时任务调度器
     """
     try:
         scheduler = BackgroundScheduler()
+        
+        # 1. GitLab MR 日报定时任务
         crontab_expression = os.getenv('REPORT_CRONTAB_EXPRESSION', '0 17 * * 1-5')
         cron_parts = crontab_expression.split()
         cron_minute, cron_hour, cron_day, cron_month, cron_day_of_week = cron_parts
 
-        # Schedule the task based on the crontab expression
         scheduler.add_job(
             yesterday_mr_top10,
             trigger=CronTrigger(
@@ -347,6 +615,24 @@ def setup_scheduler():
                 month=cron_month,
                 day_of_week=cron_day_of_week
             )
+        )
+        
+        # 2. SonarQube 质量日报定时任务
+        sonar_crontab = os.getenv('SONAR_REPORT_CRONTAB_EXPRESSION', '0 16 * * 1-5')  # 工作日
+        sonar_cron_parts = sonar_crontab.split()
+        sonar_minute, sonar_hour, sonar_day, sonar_month, sonar_day_of_week = sonar_cron_parts
+        
+        scheduler.add_job(
+            get_sonarqube_quality_summary,
+            trigger=CronTrigger(
+                minute=sonar_minute,
+                hour=sonar_hour,
+                day=sonar_day,
+                month=sonar_month,
+                day_of_week=sonar_day_of_week
+            ),
+            id='sonarqube_daily_report',
+            name='SonarQube Daily Report'
         )
 
         # Start the scheduler
