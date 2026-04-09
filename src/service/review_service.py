@@ -84,6 +84,32 @@ class ReviewService:
                         deletions INTEGER DEFAULT 0
                     )
                 '''
+        elif table_name == "dingtalk_user_map":
+            if is_mysql:
+                return '''
+                    CREATE TABLE IF NOT EXISTS dingtalk_user_map (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        git_username VARCHAR(255) NOT NULL COMMENT 'Git平台用户名(GitLab/GitHub/Gitea)',
+                        dingtalk_userid VARCHAR(255) DEFAULT NULL COMMENT '钉钉用户ID',
+                        dingtalk_mobile VARCHAR(20) DEFAULT NULL COMMENT '钉钉绑定的手机号',
+                        remark VARCHAR(255) DEFAULT NULL COMMENT '备注(如姓名)',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE INDEX idx_git_username (git_username)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                '''
+            else:
+                return '''
+                    CREATE TABLE IF NOT EXISTS dingtalk_user_map (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        git_username TEXT NOT NULL UNIQUE,
+                        dingtalk_userid TEXT,
+                        dingtalk_mobile TEXT,
+                        remark TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                '''
         return ""
 
     @staticmethod
@@ -105,6 +131,9 @@ class ReviewService:
                         for column in columns:
                             if not conn.column_exists(table, column):
                                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} INTEGER DEFAULT 0")
+
+                # 创建 dingtalk_user_map 表
+                conn.execute(ReviewService._get_create_table_sql("dingtalk_user_map"))
 
                 conn.commit()
                 print(f"Database initialized successfully using {DatabaseFactory.get_db_type()}")
@@ -267,6 +296,146 @@ class ReviewService:
             return df
         # 按分数升序排序，获取前10条（分数最低的）
         return df.nsmallest(10, 'score')
+
+    # ==================== 钉钉用户映射相关方法 ====================
+
+    @staticmethod
+    def get_dingtalk_user_by_git_username(git_username: str) -> dict:
+        """
+        根据 Git 用户名查询钉钉用户映射信息
+
+        :param git_username: Git 平台用户名
+        :return: {'dingtalk_userid': ..., 'dingtalk_mobile': ..., 'remark': ...} 或空字典
+        """
+        try:
+            with get_db_connection() as conn:
+                result = conn.fetchone(
+                    "SELECT dingtalk_userid, dingtalk_mobile, remark FROM dingtalk_user_map WHERE git_username = ?",
+                    (git_username,)
+                )
+                if result:
+                    return {
+                        'dingtalk_userid': result[0],
+                        'dingtalk_mobile': result[1],
+                        'remark': result[2]
+                    }
+                return {}
+        except Exception as e:
+            print(f"[ReviewService] Error querying dingtalk user map: {e}")
+            return {}
+
+    @staticmethod
+    def get_all_dingtalk_user_maps() -> list:
+        """获取所有钉钉用户映射"""
+        try:
+            with get_db_connection() as conn:
+                rows = conn.fetchall(
+                    "SELECT id, git_username, dingtalk_userid, dingtalk_mobile, remark FROM dingtalk_user_map ORDER BY id"
+                )
+                return [
+                    {
+                        'id': row[0],
+                        'git_username': row[1],
+                        'dingtalk_userid': row[2],
+                        'dingtalk_mobile': row[3],
+                        'remark': row[4]
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            print(f"[ReviewService] Error querying all dingtalk user maps: {e}")
+            return []
+
+    @staticmethod
+    def upsert_dingtalk_user_map(git_username: str, dingtalk_userid: str = None,
+                                  dingtalk_mobile: str = None, remark: str = None) -> bool:
+        """
+        新增或更新钉钉用户映射
+
+        :param git_username: Git 平台用户名
+        :param dingtalk_userid: 钉钉用户 ID
+        :param dingtalk_mobile: 钉钉绑定的手机号
+        :param remark: 备注
+        :return: 是否成功
+        """
+        try:
+            with get_db_connection() as conn:
+                existing = conn.fetchone(
+                    "SELECT id FROM dingtalk_user_map WHERE git_username = ?",
+                    (git_username,)
+                )
+                if existing:
+                    conn.execute(
+                        "UPDATE dingtalk_user_map SET dingtalk_userid = ?, dingtalk_mobile = ?, remark = ? WHERE git_username = ?",
+                        (dingtalk_userid, dingtalk_mobile, remark, git_username)
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO dingtalk_user_map (git_username, dingtalk_userid, dingtalk_mobile, remark) VALUES (?, ?, ?, ?)",
+                        (git_username, dingtalk_userid, dingtalk_mobile, remark)
+                    )
+                conn.commit()
+                print(f"[ReviewService] Dingtalk user map upserted: {git_username}")
+                return True
+        except Exception as e:
+            print(f"[ReviewService] Error upserting dingtalk user map: {e}")
+            return False
+
+    @staticmethod
+    def delete_dingtalk_user_map(git_username: str) -> bool:
+        """
+        删除钉钉用户映射
+
+        :param git_username: Git 平台用户名
+        :return: 是否成功
+        """
+        try:
+            with get_db_connection() as conn:
+                conn.execute(
+                    "DELETE FROM dingtalk_user_map WHERE git_username = ?",
+                    (git_username,)
+                )
+                conn.commit()
+                print(f"[ReviewService] Dingtalk user map deleted: {git_username}")
+                return True
+        except Exception as e:
+            print(f"[ReviewService] Error deleting dingtalk user map: {e}")
+            return False
+
+    @staticmethod
+    def get_latest_authors_by_project(project_name: str, limit: int = 5) -> list:
+        """
+        根据项目名称查询最近的 PR/Push 提交者
+
+        :param project_name: 项目名称
+        :param limit: 返回数量
+        :return: 去重的作者列表
+        """
+        try:
+            with get_db_connection() as conn:
+                # 先从 MR 日志中查找
+                rows = conn.fetchall(
+                    """SELECT DISTINCT author FROM mr_review_log
+                       WHERE project_name = ?
+                       ORDER BY updated_at DESC LIMIT ?""",
+                    (project_name, limit)
+                )
+                authors = [row[0] for row in rows if row[0]]
+
+                # 如果 MR 中没找到，从 Push 日志中查找
+                if not authors:
+                    rows = conn.fetchall(
+                        """SELECT DISTINCT author FROM push_review_log
+                           WHERE project_name = ?
+                           ORDER BY updated_at DESC LIMIT ?""",
+                        (project_name, limit)
+                    )
+                    authors = [row[0] for row in rows if row[0]]
+
+                return authors
+        except Exception as e:
+            print(f"[ReviewService] Error querying latest authors: {e}")
+            return []
 
 
 # Initialize database

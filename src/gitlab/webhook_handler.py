@@ -1,11 +1,179 @@
 import os
 import re
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 import fnmatch
 import requests
 
 from src.utils.log import logger
+
+
+def get_mr_commit_authors(project_path: str, mr_iid: str, gitlab_url: str = None,
+                          gitlab_token: str = None) -> list:
+    """
+    根据 MR 编号查询该 MR 内所有 commit 的开发者清单
+
+    :param project_path: GitLab 项目路径（如 group/project-name）
+    :param mr_iid: MR 的 IID（项目内编号）
+    :param gitlab_url: GitLab 服务器地址，默认从环境变量获取
+    :param gitlab_token: GitLab Access Token，默认从环境变量获取
+    :return: 去重的开发者用户名列表
+    """
+    gitlab_url = gitlab_url or os.getenv('GITLAB_URL', '')
+    gitlab_token = gitlab_token or os.getenv('GITLAB_ACCESS_TOKEN', '')
+
+    if not gitlab_url or not gitlab_token:
+        logger.warning("GitLab URL or token not configured, cannot query MR commit authors")
+        return []
+
+    if not mr_iid:
+        logger.warning("MR IID is empty, cannot query commit authors")
+        return []
+
+    # 先通过项目路径获取项目 ID
+    project_id = _resolve_project_id(project_path, gitlab_url, gitlab_token)
+    if not project_id:
+        return []
+
+    # 查询 MR 内的所有 commits
+    try:
+        url = urljoin(
+            f"{gitlab_url}/",
+            f"api/v4/projects/{project_id}/merge_requests/{mr_iid}/commits"
+        )
+        headers = {'Private-Token': gitlab_token}
+        params = {'per_page': 100}
+
+        response = requests.get(url, headers=headers, params=params, verify=False, timeout=10)
+
+        if response.status_code == 200:
+            commits = response.json()
+            authors = []
+            seen = set()
+            for commit in commits:
+                # 优先取 author_email 对应的 GitLab 用户名
+                author_name = commit.get('author_name', '')
+                author_email = commit.get('author_email', '')
+                if author_name and author_name not in seen:
+                    authors.append(author_name)
+                    seen.add(author_name)
+            logger.info(f"GitLab API: found {len(authors)} commit authors in MR !{mr_iid} of project {project_path}: {authors}")
+            return authors
+        elif response.status_code == 404:
+            logger.warning(f"GitLab MR !{mr_iid} not found in project {project_path} (id={project_id})")
+            return []
+        else:
+            logger.warning(f"GitLab API error querying MR !{mr_iid} commits: {response.status_code}, {response.text}")
+            return []
+    except Exception as e:
+        logger.error(f"Error querying MR commit authors: {e}")
+        return []
+
+
+def get_mr_submit_author(project_path: str, mr_iid: str, gitlab_url: str = None,
+                         gitlab_token: str = None) -> dict:
+    """
+    根据 MR 编号查询该 MR 的发起者（提交 PR 的人）
+
+    :param project_path: GitLab 项目路径（如 group/project-name）
+    :param mr_iid: MR 的 IID（项目内编号）
+    :param gitlab_url: GitLab 服务器地址，默认从环境变量获取
+    :param gitlab_token: GitLab Access Token，默认从环境变量获取
+    :return: {'username': ..., 'name': ...} 或空字典
+    """
+    gitlab_url = gitlab_url or os.getenv('GITLAB_URL', '')
+    gitlab_token = gitlab_token or os.getenv('GITLAB_ACCESS_TOKEN', '')
+
+    if not gitlab_url or not gitlab_token:
+        logger.warning("GitLab URL or token not configured, cannot query MR submit author")
+        return {}
+
+    if not mr_iid:
+        logger.warning("MR IID is empty, cannot query submit author")
+        return {}
+
+    project_id = _resolve_project_id(project_path, gitlab_url, gitlab_token)
+    if not project_id:
+        return {}
+
+    try:
+        url = urljoin(
+            f"{gitlab_url}/",
+            f"api/v4/projects/{project_id}/merge_requests/{mr_iid}"
+        )
+        headers = {'Private-Token': gitlab_token}
+
+        response = requests.get(url, headers=headers, verify=False, timeout=10)
+
+        if response.status_code == 200:
+            mr_data = response.json()
+            author = mr_data.get('author', {})
+            result = {
+                'username': author.get('username', ''),
+                'name': author.get('name', ''),
+                'web_url': mr_data.get('web_url', ''),
+                'source_branch': mr_data.get('source_branch', ''),
+                'target_branch': mr_data.get('target_branch', ''),
+            }
+            logger.info(f"GitLab API: MR !{mr_iid} submit author: {result['username']} ({result['name']}), web_url: {result['web_url']}")
+            return result
+        elif response.status_code == 404:
+            logger.warning(f"GitLab MR !{mr_iid} not found in project {project_path} (id={project_id})")
+            return {}
+        else:
+            logger.warning(f"GitLab API error querying MR !{mr_iid}: {response.status_code}, {response.text}")
+            return {}
+    except Exception as e:
+        logger.error(f"Error querying MR submit author: {e}")
+        return {}
+
+
+def _resolve_project_id(project_path: str, gitlab_url: str, gitlab_token: str):
+    """
+    根据项目路径解析 GitLab 项目 ID
+
+    :param project_path: 项目路径（如 group/project-name）
+    :param gitlab_url: GitLab 服务器地址
+    :param gitlab_token: GitLab Access Token
+    :return: 项目 ID 或 None
+    """
+    headers = {'Private-Token': gitlab_token}
+
+    # 方式1：通过 URL-encoded 路径精确查询
+    try:
+        encoded_path = quote(project_path, safe='')
+        url = urljoin(f"{gitlab_url}/", f"api/v4/projects/{encoded_path}")
+        response = requests.get(url, headers=headers, verify=False, timeout=10)
+
+        if response.status_code == 200:
+            project_id = response.json().get('id')
+            logger.info(f"GitLab API: resolved project '{project_path}' -> id={project_id}")
+            return project_id
+    except Exception as e:
+        logger.debug(f"Failed to resolve project by path '{project_path}': {e}")
+
+    # 方式2：搜索项目名（兼容 SonarQube key 格式如 com.example:project-name）
+    search_name = project_path.split(':')[-1].split('/')[-1]
+    try:
+        url = urljoin(f"{gitlab_url}/", "api/v4/projects")
+        params = {
+            'search': search_name,
+            'per_page': 5,
+            'order_by': 'last_activity_at',
+            'sort': 'desc'
+        }
+        response = requests.get(url, headers=headers, params=params, verify=False, timeout=10)
+
+        if response.status_code == 200 and response.json():
+            project = response.json()[0]
+            project_id = project.get('id')
+            logger.info(f"GitLab API: search matched project '{project.get('path_with_namespace')}' (id={project_id}) for '{search_name}'")
+            return project_id
+    except Exception as e:
+        logger.debug(f"Failed to search project '{search_name}': {e}")
+
+    logger.warning(f"GitLab API: could not resolve project for '{project_path}'")
+    return None
 
 
 def filter_changes(changes: list):

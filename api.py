@@ -5,6 +5,7 @@ load_dotenv("config/.env")
 import atexit
 import json
 import os
+import re
 import traceback
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
@@ -15,12 +16,13 @@ from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, request, jsonify, send_from_directory
 import os
 
-from src.gitlab.webhook_handler import slugify_url
+from src.gitlab.webhook_handler import slugify_url, get_mr_commit_authors, get_mr_submit_author
 from src.queue.worker import handle_merge_request_event, handle_push_event, handle_github_pull_request_event, \
     handle_github_push_event, handle_gitea_push_event, handle_gitea_pull_request_event
 from src.service.review_service import ReviewService
 from src.utils.code_reviewer import CodeReviewer
 from src.utils.messaging import notifier
+from src.utils.messaging.notifier import send_dingtalk_work_notification
 from src.utils.log import logger
 from src.utils.queue import handle_queue
 from src.utils.reporter import Reporter
@@ -490,14 +492,572 @@ def generate_sonarqube_notification(facets_summary, total_projects, query):
         suggestions.append("- ✅ 整体质量状况良好，继续保持！")
     
     content += "\n".join(suggestions)
-    
+
     content += f"\n\n查看详情：[{sonar_url}]({sonar_url}/projects)"
-    
+
     return content
 
 
+@api_app.route('/api/sonarqube/webhook', methods=['POST'])
+def handle_sonarqube_webhook():
+    """
+    接收 SonarQube 质量门禁 Webhook 通知
+    触发时机：项目分析完成后，根据质量门状态发送通知
 
-# 昨日 code review
+    SonarQube Webhook 发送的数据格式：
+    {
+        "serverUrl": "http://localhost:9000",
+        "taskId": "e5aff8b8-1daa-4a9e-95d4-e6eba53868b7",
+        "status": "SUCCESS",
+        "project": {
+            "key": "my-project",
+            "name": "My Project",
+            "url": "http://localhost:9000/dashboard?id=my-project"
+        },
+        "qualityGate": {
+            "status": "OK" | "ERROR",
+            "name": "Quality Gate Name",
+            "conditions": [
+                {
+                    "metric": "new_coverage",
+                    "operator": "LESS_THAN",
+                    "value": "80",
+                    "threshold": "80",
+                    "status": "OK" | "ERROR"
+                }
+            ]
+        },
+        "analysisId": "e5aff8b8-1daa-4a9e-95d4-e6eba53868b7",
+        "analysis": {
+            "date": "2023-01-01T12:00:00+0000"
+        }
+    }
+    """
+    try:
+        # 获取 JSON 数据
+        data = request.get_json()
+        if not data:
+            logger.error("SonarQube webhook: No JSON data received")
+            return jsonify({"error": "No JSON data received"}), 400
+
+        logger.info(f"Received SonarQube webhook: {json.dumps(data, ensure_ascii=False)}")
+
+        # 提取关键信息
+        project = data.get('project', {})
+        branch = data.get('branch', {})
+        project_key = project.get('key', 'Unknown')
+        project_name = project.get('name', project_key)
+        project_url = branch.get('url', '')
+
+        quality_gate = data.get('qualityGate', {})
+        gate_status = quality_gate.get('status', 'UNKNOWN')
+        gate_name = quality_gate.get('name', 'Unknown')
+        conditions = quality_gate.get('conditions', [])
+
+        analysis_date = data.get('analysis', {}).get('date', '')
+        server_url = data.get('serverUrl', os.getenv('SONAR_URL', ''))
+
+        # 解析分析时间
+        # SonarQube 的时间格式如: 2024-01-01T12:00:00+0800
+        analysis_time_str = ''
+        try:
+            if analysis_date:
+                # 兼容多种时区格式: +0800, +0000, Z
+                clean_date = re.sub(r'([+-]\d{2})(\d{2})$', r'\1:\2', analysis_date)
+                analysis_dt = datetime.fromisoformat(clean_date)
+                analysis_time_str = analysis_dt.strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            analysis_time_str = analysis_date or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # 判断是否需要发送通知（只在 ERROR 状态时发送，或者配置为总是发送）
+        notify_on_success = os.environ.get('SONAR_WEBHOOK_NOTIFY_ON_SUCCESS', 'false').lower() == 'true'
+
+        # if gate_status != 'ERROR' and not notify_on_success:
+        #     logger.info(f"SonarQube quality gate passed for {project_name}, skipping notification")
+        #     return jsonify({
+        #         "message": "Quality gate passed, notification skipped",
+        #         "project": project_name,
+        #         "status": gate_status
+        #     }), 200
+
+        # ========== 通过 PR 提交者精准通知 ==========
+        # 从 SonarQube webhook payload 提取分支/PR 信息
+        branch_info = data.get('branch', {})
+        branch_name = branch_info.get('name', '')
+        branch_type = branch_info.get('type', '')  # PULL_REQUEST 或 BRANCH
+
+        # 当 SonarQube 分析的是 PR 时，branch.name 就是 MR 编号
+        mr_iid = None
+        if branch_type == 'PULL_REQUEST' and branch_name:
+            mr_iid = branch_name
+            logger.info(f"SonarQube webhook: detected PR analysis, MR IID={mr_iid}")
+            # 补充 pullRequest 参数，使链接跳转到 PR 分析页
+            if project_url and 'pullRequest' not in project_url:
+                separator = '&' if '?' in project_url else '?'
+                project_url = f"{project_url}{separator}pullRequest={mr_iid}"
+        else:
+            # 非 PR 分析场景，尝试从 properties 中获取 MR 编号
+            properties = data.get('properties', {})
+            mr_iid = properties.get('sonar.pullrequest.key') or properties.get('sonar.analysis.mrIid')
+            if mr_iid:
+                logger.info(f"SonarQube webhook: found MR IID from properties: {mr_iid}")
+
+        # 1. 根据 MR 编号，通过 GitLab API 查询该 MR 内所有 commit 的开发者 + MR 发起者
+        authors = []
+        mr_submitter = None
+        if mr_iid:
+            # 查询 MR 内 commit 的开发者
+            # authors = get_mr_commit_authors(project_key, mr_iid)
+            # if not authors and project_name != project_key:
+            #     authors = get_mr_commit_authors(project_name, mr_iid)
+
+            # 查询 MR 发起者
+            mr_submitter = get_mr_submit_author(project_key, mr_iid)
+            if not mr_submitter and project_name != project_key:
+                mr_submitter = get_mr_submit_author(project_name, mr_iid)
+
+            # 将 MR 发起者合并到 authors 列表（去重）
+            if mr_submitter and mr_submitter.get('username'):
+                submitter_name = mr_submitter['username']
+                if submitter_name not in authors:
+                    authors.append(submitter_name)
+        else:
+            logger.warning(f"SonarQube webhook: no MR IID found in payload for {project_key}, cannot identify PR authors")
+
+        logger.info(f"SonarQube webhook: MR !{mr_iid} authors for {project_key}: {authors} (submitter: {mr_submitter})")
+
+        # 2. 从映射表中查询每个提交者的钉钉用户信息
+        target_user_ids = []
+        target_mobiles = []
+        matched_authors = []
+        unmatched_authors = []
+
+        for author in authors:
+            user_map = ReviewService.get_dingtalk_user_by_git_username(author)
+            if user_map:
+                matched_authors.append(author)
+                if user_map.get('dingtalk_userid'):
+                    target_user_ids.append(user_map['dingtalk_userid'])
+                elif user_map.get('dingtalk_mobile'):
+                    target_mobiles.append(user_map['dingtalk_mobile'])
+            else:
+                unmatched_authors.append(author)
+
+        if unmatched_authors:
+            logger.warning(f"SonarQube webhook: no DingTalk mapping for git users: {unmatched_authors}")
+
+        # 3. 确定最终的通知方式
+        #    优先精准通知到人，如果没有匹配到任何钉钉用户则跳过通知
+        user_ids = target_user_ids if target_user_ids else None
+        mobiles = target_mobiles if target_mobiles else None
+        is_to_all = False
+        dept_ids = None
+
+        if not user_ids and not mobiles:
+            logger.info(f"No matched DingTalk users for authors {unmatched_authors}, skipping notification")
+            return jsonify({
+                "message": "Webhook processed, but no DingTalk user mapping found, notification skipped",
+                "project": project_name,
+                "status": gate_status,
+                "notification_sent": False,
+                "matched_authors": matched_authors,
+                "unmatched_authors": unmatched_authors
+            }), 200
+        else:
+            logger.info(f"SonarQube webhook: sending to matched authors: {matched_authors}, user_ids={user_ids}, mobiles={mobiles}")
+
+        # 生成通知标题和内容
+        if gate_status == 'ERROR':
+            title = f"🚨 质量门禁失败 - {project_name}"
+        else:
+            title = f"✅ 质量门禁通过 - {project_name}"
+
+        # 从 MR 详情中获取源分支和 web_url（mr_submitter 已在前面查询过）
+        mr_web_url = ''
+        mr_source_branch = ''
+        if mr_submitter:
+            mr_web_url = mr_submitter.get('web_url', '')
+            mr_source_branch = mr_submitter.get('source_branch', '')
+
+        content = generate_sonarqube_webhook_content(
+            project_name=project_name,
+            project_key=project_key,
+            project_url=project_url,
+            gate_status=gate_status,
+            gate_name=gate_name,
+            conditions=conditions,
+            analysis_time=analysis_time_str,
+            server_url=server_url,
+            mr_iid=mr_iid,
+            mr_web_url=mr_web_url,
+            branch_name=mr_source_branch or branch_name
+        )
+
+        # 发送钉钉工作通知
+        success = send_dingtalk_work_notification(
+            title=title,
+            content=content,
+            user_ids=user_ids,
+            dept_ids=dept_ids,
+            mobiles=mobiles,
+            is_to_all=is_to_all,
+            msg_type='markdown'
+        )
+
+        if success:
+            logger.info(f"SonarQube webhook notification sent successfully for {project_name}")
+        else:
+            logger.warning(f"Failed to send SonarQube webhook notification for {project_name}")
+
+        return jsonify({
+            "message": "Webhook processed",
+            "project": project_name,
+            "status": gate_status,
+            "notification_sent": success,
+            "matched_authors": matched_authors,
+            "unmatched_authors": unmatched_authors
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error processing SonarQube webhook: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+def generate_sonarqube_webhook_content(project_name, project_key, project_url, gate_status,
+                                       gate_name, conditions, analysis_time, server_url,
+                                       mr_iid=None, mr_web_url=None, branch_name=None):
+    """
+    生成 SonarQube Webhook 的 Markdown 通知内容
+
+    :param project_name: 项目名称
+    :param project_key: 项目 Key
+    :param project_url: 项目链接
+    :param gate_status: 质量门状态（OK/ERROR）
+    :param gate_name: 质量门名称
+    :param conditions: 质量门条件列表
+    :param analysis_time: 分析时间
+    :param server_url: SonarQube 服务器地址
+    :param mr_iid: MR 编号
+    :param mr_web_url: MR 的 GitLab 页面链接
+    :param branch_name: 分支名称
+    :return: Markdown 格式的通知内容
+    """
+    # 状态相关的样式
+    if gate_status == 'ERROR':
+        status_icon = "🔴"
+        status_color = "red"
+        status_text = "**失败**"
+    else:
+        status_icon = "🟢"
+        status_color = "green"
+        status_text = "**通过**"
+
+    # 构建通知内容
+    content = f"""## {status_icon} PR-代码质量通知\n
+
+**项目名称**: {project_name}\n
+"""
+
+    if mr_iid:
+        if mr_web_url:
+            content += f"""**合并请求**: [!{mr_iid}]({mr_web_url})\n
+            """
+        else:
+            content += f"""**合并请求**: !{mr_iid}\n
+            """
+    if branch_name:
+        content += f"""**Pull分支**: {branch_name}\n
+        """
+
+    content += f"""
+**质量门**: {gate_name}\n
+**质量门状态**: {status_icon} {status_text}\n
+
+"""
+
+    # 添加失败的条件详情
+    if conditions:
+        content += "\n\n"
+        content += "| 指标 | 操作符 | 阈值 | 实际值 | 状态 |\n"
+        content += "|------|--------|------|--------|------|\n"
+
+        failed_conditions = []
+        for cond in conditions:
+            metric = cond.get('metric', 'Unknown')
+            operator = cond.get('operator', '')
+            threshold = cond.get('threshold', '-')
+            value = cond.get('value', '-')
+            status = cond.get('status', 'UNKNOWN')
+
+            # 映射指标名称为中文
+            metric_cn = {
+                'new_coverage': '新代码覆盖率',
+                'new_bugs': '新增 Bug',
+                'new_vulnerabilities': '新增漏洞',
+                'new_code_smells': '新增代码异味',
+                'new_duplicated_lines_density': '新增重复行密度',
+                'duplicated_blocks': '重复代码块',
+                'coverage': '代码覆盖率',
+                'bugs': 'Bug 数',
+                'vulnerabilities': '漏洞数',
+                'code_smells': '代码异味数',
+                'sqale_rating': '可维护性评级',
+                'reliability_rating': '可靠性评级',
+                'security_rating': '安全性评级',
+                'security_hotspots_reviewed': '安全热点已审查',
+                'new_security_hotspots_reviewed': '新增安全热点已审查',
+                'new_critical_violations': '新增严重违规',
+            }.get(metric, metric)
+
+            # 映射操作符为中文
+            operator_cn = {
+                'LESS_THAN': '<',
+                'GREATER_THAN': '>',
+                'EQUALS': '=',
+            }.get(operator, operator)
+
+            # 状态图标
+            # NO_VALUE 表示该指标无数据（如没有安全热点），视为通过
+            if status in ('OK', 'NO_VALUE'):
+                cond_status = "✅"
+            else:
+                cond_status = "❌"
+                failed_conditions.append((metric_cn, value, threshold))
+
+            content += f"| {metric_cn} | {operator_cn} | {threshold} | {value} | {cond_status} |\n"
+
+    # 添加失败原因说明
+    if failed_conditions:
+        content += "\n### ⚠️ 未达标项\n\n"
+        for metric, val, threshold in failed_conditions:
+            content += f"- **{metric}**: 实际值 `{val}` 超过阈值 `{threshold}`\n"
+
+    # 添加项目链接
+    if project_url:
+        content += f"\n[**查看详情**]({project_url})\n"
+
+    return content
+
+
+# ==================== 钉钉用户映射管理 API ====================
+
+@api_app.route('/api/dingtalk/user-map', methods=['GET'])
+def get_dingtalk_user_maps():
+    """获取所有 Git 用户名到钉钉用户的映射列表"""
+    try:
+        maps = ReviewService.get_all_dingtalk_user_maps()
+        return jsonify({'data': maps, 'total': len(maps)}), 200
+    except Exception as e:
+        logger.error(f"Failed to get dingtalk user maps: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@api_app.route('/api/dingtalk/user-map', methods=['POST'])
+def create_or_update_dingtalk_user_map():
+    """
+    新增或更新 Git 用户名到钉钉用户的映射
+
+    请求体:
+    {
+        "git_username": "zhangsan",
+        "dingtalk_userid": "xxx",     // 可选，钉钉用户ID
+        "dingtalk_mobile": "138xxxx", // 可选，手机号（至少填一个）
+        "remark": "张三"               // 可选
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data received'}), 400
+
+        git_username = data.get('git_username', '').strip()
+        if not git_username:
+            return jsonify({'error': 'git_username is required'}), 400
+
+        dingtalk_userid = data.get('dingtalk_userid', '').strip() or None
+        dingtalk_mobile = data.get('dingtalk_mobile', '').strip() or None
+        remark = data.get('remark', '').strip() or None
+
+        if not dingtalk_userid and not dingtalk_mobile:
+            return jsonify({'error': 'At least one of dingtalk_userid or dingtalk_mobile is required'}), 400
+
+        success = ReviewService.upsert_dingtalk_user_map(
+            git_username=git_username,
+            dingtalk_userid=dingtalk_userid,
+            dingtalk_mobile=dingtalk_mobile,
+            remark=remark
+        )
+
+        if success:
+            return jsonify({'message': f'User map for {git_username} saved successfully'}), 200
+        else:
+            return jsonify({'error': 'Failed to save user map'}), 500
+    except Exception as e:
+        logger.error(f"Failed to create/update dingtalk user map: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@api_app.route('/api/dingtalk/user-map/<git_username>', methods=['DELETE'])
+def delete_dingtalk_user_map(git_username):
+    """删除 Git 用户名到钉钉用户的映射"""
+    try:
+        success = ReviewService.delete_dingtalk_user_map(git_username)
+        if success:
+            return jsonify({'message': f'User map for {git_username} deleted successfully'}), 200
+        else:
+            return jsonify({'error': 'Failed to delete user map'}), 500
+    except Exception as e:
+        logger.error(f"Failed to delete dingtalk user map: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@api_app.route('/api/dingtalk/user-map/batch', methods=['POST'])
+def batch_create_dingtalk_user_maps():
+    """
+    批量导入 Git 用户名到钉钉用户的映射
+
+    请求体:
+    {
+        "mappings": [
+            {"git_username": "zhangsan", "dingtalk_mobile": "138xxxx", "remark": "张三"},
+            {"git_username": "lisi", "dingtalk_userid": "xxx", "remark": "李四"}
+        ]
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data or 'mappings' not in data:
+            return jsonify({'error': 'mappings field is required'}), 400
+
+        mappings = data['mappings']
+        success_count = 0
+        failed = []
+
+        for item in mappings:
+            git_username = item.get('git_username', '').strip()
+            if not git_username:
+                failed.append({'item': item, 'reason': 'git_username is required'})
+                continue
+
+            dingtalk_userid = item.get('dingtalk_userid', '').strip() or None
+            dingtalk_mobile = item.get('dingtalk_mobile', '').strip() or None
+            remark = item.get('remark', '').strip() or None
+
+            if not dingtalk_userid and not dingtalk_mobile:
+                failed.append({'item': item, 'reason': 'At least one of dingtalk_userid or dingtalk_mobile is required'})
+                continue
+
+            if ReviewService.upsert_dingtalk_user_map(
+                git_username=git_username,
+                dingtalk_userid=dingtalk_userid,
+                dingtalk_mobile=dingtalk_mobile,
+                remark=remark
+            ):
+                success_count += 1
+            else:
+                failed.append({'item': item, 'reason': 'Database error'})
+
+        return jsonify({
+            'message': f'Batch import completed: {success_count} succeeded, {len(failed)} failed',
+            'success_count': success_count,
+            'failed_count': len(failed),
+            'failed': failed
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to batch create dingtalk user maps: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@api_app.route('/api/dingtalk/user-map/sync-gitlab', methods=['POST'])
+def sync_gitlab_users_to_dingtalk_map():
+    """
+    将 GitLab 用户清单同步到 dingtalk_user_map 表中
+    已存在的用户跳过，仅插入新用户
+
+    请求体（可选）:
+    {
+        "gitlab_url": "https://gitlab.example.com",   // 可选，默认从环境变量读取
+        "gitlab_token": "xxx"                          // 可选，默认从环境变量读取
+    }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        gitlab_url = data.get('gitlab_url', '').strip() or os.getenv('GITLAB_URL', '')
+        gitlab_token = data.get('gitlab_token', '').strip() or os.getenv('GITLAB_ACCESS_TOKEN', '')
+
+        if not gitlab_url or not gitlab_token:
+            return jsonify({'error': 'GitLab URL and token are required. Set GITLAB_URL/GITLAB_ACCESS_TOKEN or pass in request body.'}), 400
+
+        # 分页拉取所有 GitLab 用户
+        headers = {'Private-Token': gitlab_token}
+        all_users = []
+        page = 1
+        per_page = 100
+
+        while True:
+            url = f"{gitlab_url.rstrip('/')}/api/v4/users"
+            params = {'per_page': per_page, 'page': page, 'active': True}
+            response = requests.get(url, headers=headers, params=params, verify=False, timeout=15)
+
+            if response.status_code != 200:
+                logger.error(f"GitLab users API error: {response.status_code}, {response.text}")
+                return jsonify({'error': f'GitLab API error: {response.status_code}', 'details': response.text}), 502
+
+            users = response.json()
+            if not users:
+                break
+
+            all_users.extend(users)
+            page += 1
+
+        logger.info(f"Fetched {len(all_users)} active users from GitLab")
+
+        # 获取已有映射的 git_username 集合
+        existing_maps = ReviewService.get_all_dingtalk_user_maps()
+        existing_usernames = {m['git_username'] for m in existing_maps}
+
+        # 同步：已存在则跳过
+        inserted = 0
+        skipped = 0
+        failed_list = []
+
+        for user in all_users:
+            username = user.get('username', '')
+            if not username:
+                continue
+
+            if username in existing_usernames:
+                skipped += 1
+                continue
+
+            name = user.get('name', '')
+            success = ReviewService.upsert_dingtalk_user_map(
+                git_username=username,
+                dingtalk_userid=None,
+                dingtalk_mobile=None,
+                remark=name
+            )
+            if success:
+                inserted += 1
+            else:
+                failed_list.append(username)
+
+        return jsonify({
+            'message': f'Sync completed: {inserted} inserted, {skipped} skipped, {len(failed_list)} failed',
+            'total_gitlab_users': len(all_users),
+            'inserted': inserted,
+            'skipped': skipped,
+            'failed_count': len(failed_list),
+            'failed': failed_list
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to sync GitLab users: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
 @api_app.route('/review/yesterday_report', methods=['GET'])
 def yesterday_mr_top10():
     """
