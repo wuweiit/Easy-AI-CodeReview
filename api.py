@@ -572,13 +572,13 @@ def handle_sonarqube_webhook():
         # 判断是否需要发送通知（只在 ERROR 状态时发送，或者配置为总是发送）
         notify_on_success = os.environ.get('SONAR_WEBHOOK_NOTIFY_ON_SUCCESS', 'false').lower() == 'true'
 
-        # if gate_status != 'ERROR' and not notify_on_success:
-        #     logger.info(f"SonarQube quality gate passed for {project_name}, skipping notification")
-        #     return jsonify({
-        #         "message": "Quality gate passed, notification skipped",
-        #         "project": project_name,
-        #         "status": gate_status
-        #     }), 200
+        if gate_status != 'ERROR' and not notify_on_success:
+            logger.info(f"SonarQube quality gate passed for {project_name}, skipping notification")
+            return jsonify({
+                "message": "Quality gate passed, notification skipped",
+                "project": project_name,
+                "status": gate_status
+            }), 200
 
         # ========== 通过 PR 提交者精准通知 ==========
         # 从 SonarQube webhook payload 提取分支/PR 信息
